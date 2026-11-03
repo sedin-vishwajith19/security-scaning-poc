@@ -1,0 +1,71 @@
+// gitleaks secret-scan stage (POC)
+// Needs plugins: Pipeline, Git, Pipeline Utility Steps (for readJSON)
+
+pipeline {
+  agent any
+
+  parameters {
+    // false = report-only mode (first 2 weeks). true = fail build on blocking rules.
+    booleanParam(name: 'ENFORCE_SECRET_SCAN', defaultValue: false,
+                 description: 'Fail the build on blocking secret findings')
+  }
+
+  options {
+    timestamps()
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        // Full history is needed for gitleaks to scan old commits.
+        // For "Pipeline script from SCM" this is already full; make sure
+        // "Shallow clone" is NOT enabled in the job's Git settings.
+        checkout scm
+      }
+    }
+
+    stage('Secret scan (gitleaks)') {
+      steps {
+        sh '''
+          gitleaks git . \
+            --config .gitleaks.toml \
+            --redact \
+            --report-format json \
+            --report-path gitleaks-report.json \
+            --exit-code 0
+        '''
+
+        script {
+          def findings = readJSON(file: 'gitleaks-report.json') ?: []
+
+          // 🟠 "Must fix" rules: reported, never fail the build
+          def nonBlockingRules = ['generic-api-key', 'jwt']
+
+          def blocking    = findings.findAll { !(it.RuleID in nonBlockingRules) }
+          def nonBlocking = findings.findAll {  (it.RuleID in nonBlockingRules) }
+
+          echo "gitleaks: ${findings.size()} finding(s) | blocking: ${blocking.size()} | must-fix: ${nonBlocking.size()}"
+          findings.each { f ->
+            echo "  [${f.RuleID}] ${f.File}:${f.StartLine}  commit=${f.Commit}  author=${f.Author}"
+          }
+
+          if (blocking && params.ENFORCE_SECRET_SCAN) {
+            error("🔴 Secret scan failed: ${blocking.size()} blocking finding(s). Revoke the secret first, then remove it from code.")
+          } else if (findings) {
+            unstable("🟠 Secret scan found ${findings.size()} issue(s). See gitleaks-report.json")
+          } else {
+            echo "✅ No secrets found"
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true
+        }
+      }
+    }
+
+    // stage('Build') { ... your existing stages ... }
+  }
+}

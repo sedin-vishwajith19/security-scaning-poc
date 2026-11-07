@@ -1,0 +1,25 @@
+# INTENTIONALLY INSECURE docker-compose file for the KICS POC demo.
+# All values are fake.
+
+services:
+  app:
+    build: .
+    privileged: true                         # FAIL: privileged container
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock   # FAIL: Docker socket mounted
+      - /etc:/host-etc                       # sensitive host folder
+    network_mode: host                       # host network
+    pid: host                                # host PID namespace
+    cap_add:
+      - NET_ADMIN                            # extra capability, no cap_drop
+    security_opt:
+      - seccomp:unconfined                   # seccomp disabled
+    environment:
+      - DB_PASSWORD=Sup3rS3cretValue99       # FAIL: secret in environment
+    # no cpu/memory limits, no healthcheck, no restart policy, no read_only
+
+  db:
+    image: postgres:16
+    ports:
+      - "5432:5432"                          # DB exposed on all interfaces
+    ipc: host                                # host IPC namespace

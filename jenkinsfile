@@ -78,9 +78,9 @@ pipeline {
 
           semgrep scan \
             --config "$COMMUNITY_RULES/dockerfile" \
-            --config .semgrep/ \
+            --config semgrep-rules/ \
             $CODE_CONFIGS \
-            --exclude .semgrep \
+            --exclude semgrep-rules \
             --scan-unknown-extensions \
             --metrics=off \
             --disable-version-check \

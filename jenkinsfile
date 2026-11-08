@@ -1,32 +1,43 @@
-// Security scans POC: gitleaks (secrets) + KICS (Dockerfile / Docker Compose)
-// Plugins needed: Pipeline, Git, Pipeline Utility Steps (readJSON)
-// Tools needed in the Jenkins container: gitleaks (/usr/local/bin), KICS (/opt/kics)
+// Security scanning POC: 3 tools, 3 reports
+//   1. gitleaks -> gitleaks-report.json            (secrets in code + Git history)
+//   2. Semgrep  -> semgrep-report.json             (Dockerfile + Docker Compose, later app code)
+//   3. Trivy    -> trivy-report.json (+ .html)     (Docker image: CVEs, secrets in layers, EOL OS)
+//
+// Plugins: Pipeline, Git, Pipeline Utility Steps (readJSON), Timestamper
+// Tools in the Jenkins container: gitleaks, semgrep (+ /opt/semgrep-rules/community), trivy
 
 pipeline {
   agent any
 
   parameters {
-    booleanParam(name: 'ENFORCE_SECRET_SCAN', defaultValue: false,
-                 description: 'Fail the build on blocking secret findings (gitleaks)')
-    booleanParam(name: 'ENFORCE_CONFIG_SCAN', defaultValue: false,
-                 description: 'Fail the build on blocking Dockerfile/Compose findings (KICS)')
+    string(name: 'IMAGE_TO_SCAN', defaultValue: 'python:3.8-slim-buster',
+           description: 'Image for Trivy to scan from the registry (no Docker needed). Try python:3.12-slim for the "after" run.')
+    booleanParam(name: 'ENFORCE_SECRET_SCAN', defaultValue: false, description: 'gitleaks: fail build on 🔴 findings')
+    booleanParam(name: 'ENFORCE_CONFIG_SCAN', defaultValue: false, description: 'Semgrep: fail build on 🔴 findings')
+    booleanParam(name: 'ENFORCE_IMAGE_SCAN',  defaultValue: false, description: 'Trivy: fail build on 🔴 findings')
   }
 
   options {
     timestamps()
-    skipDefaultCheckout()   // avoid the double checkout seen in the gitleaks POC
+    skipDefaultCheckout()
+  }
+
+  environment {
+    SEMGREP_SEND_METRICS = 'off'
+    COMMUNITY_RULES      = '/opt/semgrep-rules/community'
+    CODE_RULE_DIRS       = ''   // later, e.g. "/opt/semgrep-rules/community/python /opt/semgrep-rules/community/javascript"
   }
 
   stages {
 
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
-    // ------------------------------------------------------------------
-    stage('Secret scan (gitleaks)') {
+    // =====================================================================
+    // 1. gitleaks
+    // =====================================================================
+    stage('1. Secret scan (gitleaks)') {
       steps {
         sh '''
           gitleaks git . \
@@ -39,108 +50,154 @@ pipeline {
         script {
           def findings = readJSON(file: 'gitleaks-report.json') ?: []
           def nonBlockingRules = ['generic-api-key', 'jwt']
-          def blocking = findings.findAll { !(it.RuleID in nonBlockingRules) }
+          def fail = [], mustFix = []
 
-          echo "gitleaks: ${findings.size()} finding(s) | blocking: ${blocking.size()}"
-          findings.each { f -> echo "  [${f.RuleID}] ${f.File}:${f.StartLine}  commit=${f.Commit}" }
-
-          if (blocking && params.ENFORCE_SECRET_SCAN) {
-            error("🔴 Secret scan failed: ${blocking.size()} blocking finding(s).")
-          } else if (findings) {
-            unstable("🟠 Secret scan found ${findings.size()} issue(s).")
+          findings.each { f ->
+            def line = "${f.RuleID} -> ${f.File}:${f.StartLine} (commit ${f.Commit.substring(0, 8)}, ${f.Author})"
+            if (f.RuleID in nonBlockingRules) { mustFix << line } else { fail << line }
           }
+
+          printSummary('gitleaks', fail, mustFix, [])
+          decide('Secret scan', fail, mustFix, params.ENFORCE_SECRET_SCAN)
         }
       }
-      post {
-        always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true }
-      }
+      post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
     }
 
-    // ------------------------------------------------------------------
-    stage('Config scan (KICS: Dockerfile + Compose)') {
+    // =====================================================================
+    // 2. Semgrep
+    // =====================================================================
+    stage('2. Config scan (Semgrep)') {
       steps {
-        // KICS loads its rules from ./assets relative to where it runs,
-        // so we run it from /opt/kics and point -p at the workspace.
         sh '''
-          mkdir -p "$WORKSPACE/kics-results"
-          cd /opt/kics
-          kics scan \
-            -p "$WORKSPACE" \
-            -o "$WORKSPACE/kics-results" \
-            --type Dockerfile,DockerCompose \
-            --report-formats json,html \
-            --ignore-on-exit results \
-            --ci
+          # Semgrep auto-detects only "Dockerfile" / "*.dockerfile"; pass other names explicitly
+          EXTRA_DOCKERFILES=$(find . -path ./.git -prune -o -type f \\( -name 'Dockerfile.*' -o -name '*.Dockerfile' \\) -print | tr '\\n' ' ')
+
+          CODE_CONFIGS=""
+          for d in $CODE_RULE_DIRS; do CODE_CONFIGS="$CODE_CONFIGS --config $d"; done
+
+          semgrep scan \
+            --config "$COMMUNITY_RULES/dockerfile" \
+            --config .semgrep/ \
+            $CODE_CONFIGS \
+            --exclude .semgrep \
+            --scan-unknown-extensions \
+            --metrics=off \
+            --disable-version-check \
+            --json -o semgrep-report.json \
+            . $EXTRA_DOCKERFILES
         '''
-        // --ignore-on-exit results : findings never fail this step by themselves
-        //                            (we decide below). Engine errors still fail it.
-
         script {
-          def report = readJSON(file: 'kics-results/results.json')
-
-          // 🔴 FAIL: our blocking rules (KICS query IDs)
-          def blockingIds = [
-            'a88baa34-e2ad-44ea-ad6f-8cac87bc7c71', // Passwords And Secrets (ENV/ARG, compose environment)
-            'ae5b6871-7f45-42e0-bb4c-ab300c4d2026', // Privileged Containers Enabled
-            'd6355c88-1e8d-49e9-b2f2-f8a1ca12c75b', // Docker Socket Mounted In Container
+          def report = readJSON(file: 'semgrep-report.json')
+          def ignoredRules = ['secret-in-build-arg']   // duplicate of our stricter 'dockerfile-secret-in-arg'
+          def overrides = [
+            'missing-user'         : 'MUST-FIX',
+            'last-user-is-root'    : 'MUST-FIX',
+            'avoid-latest-version' : 'MUST-FIX',
+            'missing-image-version': 'MUST-FIX',
+            'remove-package-cache' : 'ADVISORY',
+            'remove-package-lists' : 'ADVISORY',
+            'set-pipefail'         : 'ADVISORY',
           ]
+          def fail = [], mustFix = [], advisory = []
 
-          // 🟡 ADVISORY: KICS rates these MEDIUM, our policy treats them as advisory
-          def advisoryIds = [
-            '9513a694-aa0d-41d8-be61-3271e056f36b', // Add Instead of Copy
-            '965a08d7-ef86-4f14-8792-4a3b2098937e', // Apt Get Install Pin Version Not Defined
-            'd3499f6d-1651-41bb-a9a7-de925fea487b', // Unpinned Package Version in Apk Add
-            '02d9c71f-3ee8-4986-9c27-1a20d0d19bfc', // Unpinned Package Version in Pip Install
-            'e36d8880-3f78-4546-b9a1-12f0745ca0d5', // NPM Install Command Without Pinned Version
-            '22cd11f7-9c6c-4f6e-84c0-02058120b341', // Gem Install Without Version
-            '93d88cf7-f078-46a8-8ddc-178e03aeacf1', // Missing Version Specification In dnf install
-            '6452c424-1d92-4deb-bb18-a03e95d579c4', // Yum install Without Version
-            '698ed579-b239-4f8f-a388-baa4bcb13ef8', // Healthcheck Not Set (compose)
-            'bb9ac4f7-e13b-423d-a010-c74a1bfbe492', // Memory Not Limited
-            '221e0658-cb2a-44e3-b08a-db96a341d6fa', // Pids Limit Not Set
-            '2fc99041-ddad-49d5-853f-e35e70a48391', // Restart Policy On Failure Not Set To 5
-            '610e266e-6c12-4bca-9925-1ed0cd29742b', // Security Opt Not Set
-            'b86987e1-6397-4619-81d5-8807f2387c79', // Not Using JSON In CMD And ENTRYPOINT
-            '8a301064-c291-4b20-adcb-403fe7fd95fd', // Changing Default Shell Using RUN Command
-          ]
+          (report.results ?: []).each { r ->
+            def ruleId = r.check_id.tokenize('.').last()
+            if (ruleId in ignoredRules) { return }
+            def isConfigRule = r.check_id.contains('dockerfile') || ruleId.startsWith('dockerfile-') || ruleId.startsWith('compose-')
 
-          def blocking = []
-          def mustFix  = []
-          def advisory = []
-          def prefix   = env.WORKSPACE + '/'
-
-          (report.queries ?: []).each { q ->
             def level
-            if (blockingIds.contains(q.query_id))        { level = 'FAIL' }
-            else if (advisoryIds.contains(q.query_id))   { level = 'ADVISORY' }
-            else if (q.severity in ['CRITICAL', 'HIGH', 'MEDIUM']) { level = 'MUST-FIX' }
-            else                                          { level = 'ADVISORY' }
+            if (overrides.containsKey(ruleId))      { level = overrides[ruleId] }
+            else if (r.extra.severity == 'ERROR')   { level = isConfigRule ? 'FAIL' : 'MUST-FIX' }  // code findings don't fail (yet)
+            else if (r.extra.severity == 'WARNING') { level = 'MUST-FIX' }
+            else                                    { level = 'ADVISORY' }
 
-            (q.files ?: []).each { f ->
-              def line = "[${q.severity}] ${q.query_name} -> ${f.file_name.replace(prefix, '')}:${f.line}"
-              if (level == 'FAIL')          { blocking << line }
-              else if (level == 'MUST-FIX') { mustFix  << line }
-              else                          { advisory << line }
+            def line = "${ruleId} -> ${r.path}:${r.start.line}"
+            if (level == 'FAIL') { fail << line } else if (level == 'MUST-FIX') { mustFix << line } else { advisory << line }
+          }
+          (report.errors ?: []).each { e -> echo "⚠️ Semgrep error: ${e.message}" }
+
+          printSummary('Semgrep', fail, mustFix, advisory)
+          decide('Config scan', fail, mustFix, params.ENFORCE_CONFIG_SCAN)
+        }
+      }
+      post { always { archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true } }
+    }
+
+    // =====================================================================
+    // 3. Trivy
+    // =====================================================================
+    stage('3. Image scan (Trivy)') {
+      steps {
+        sh '''
+          # --image-src remote: pull the image straight from the registry (no Docker daemon needed)
+          trivy image \
+            --image-src remote \
+            --scanners vuln,secret \
+            --format json \
+            --output trivy-report.json \
+            --exit-code 0 \
+            --no-progress \
+            "$IMAGE_TO_SCAN"
+
+          # Human-friendly HTML version of the same report (for managers)
+          if [ -f /opt/trivy/contrib/html.tpl ]; then
+            trivy convert --format template --template "@/opt/trivy/contrib/html.tpl" \
+              --output trivy-report.html trivy-report.json || echo "HTML report skipped"
+          fi
+        '''
+        script {
+          def report = readJSON(file: 'trivy-report.json')
+          def fail = [], mustFix = [], advisory = []
+
+          // Base image OS end-of-life (no more security fixes)
+          def os = report.Metadata?.OS
+          if (os?.EOSL) { mustFix << "Base image OS is END-OF-LIFE: ${os.Family} ${os.Name}" }
+
+          (report.Results ?: []).each { res ->
+            // Secrets baked into image layers
+            (res.Secrets ?: []).each { s ->
+              fail << "SECRET ${s.RuleID} in ${res.Target}:${s.StartLine}"
+            }
+            // Vulnerabilities
+            (res.Vulnerabilities ?: []).each { v ->
+              def fixed = v.FixedVersion ? true : false
+              def line  = "${v.Severity} ${v.VulnerabilityID} ${v.PkgName} ${v.InstalledVersion} -> ${v.FixedVersion ?: 'no fix yet'}"
+              if (v.Severity == 'CRITICAL' && fixed)  { fail << line }
+              else if (v.Severity == 'HIGH' && fixed) { mustFix << line }
+              else                                    { advisory << line }
             }
           }
 
-          echo "KICS: 🔴 fail: ${blocking.size()} | 🟠 must-fix: ${mustFix.size()} | 🟡 advisory: ${advisory.size()}"
-          if (blocking) { echo "🔴 FAIL:\n  " + blocking.join('\n  ') }
-          if (mustFix)  { echo "🟠 MUST FIX:\n  " + mustFix.join('\n  ') }
-          if (advisory) { echo "🟡 ADVISORY:\n  " + advisory.join('\n  ') }
-
-          if (blocking && params.ENFORCE_CONFIG_SCAN) {
-            error("🔴 Config scan failed: ${blocking.size()} blocking finding(s). See kics-results/results.html")
-          } else if (blocking || mustFix) {
-            unstable("🟠 Config scan found issues. See kics-results/results.html")
-          } else {
-            echo "✅ No blocking or must-fix config issues"
-          }
+          printSummary('Trivy', fail, mustFix, advisory)
+          decide('Image scan', fail, mustFix, params.ENFORCE_IMAGE_SCAN)
         }
       }
-      post {
-        always { archiveArtifacts artifacts: 'kics-results/**', allowEmptyArchive: true }
-      }
+      post { always { archiveArtifacts artifacts: 'trivy-report.json, trivy-report.html', allowEmptyArchive: true } }
     }
+  }
+}
+
+// -------------------------------------------------------------------------
+// Helpers (these will move into the Shared Library in the next step)
+// -------------------------------------------------------------------------
+def printSummary(String tool, List fail, List mustFix, List advisory) {
+  echo "${tool}: 🔴 fail: ${fail.size()} | 🟠 must-fix: ${mustFix.size()} | 🟡 advisory: ${advisory.size()}"
+  if (fail)     { echo "🔴 FAIL:\n  "     + firstN(fail, 50).join('\n  ') }
+  if (mustFix)  { echo "🟠 MUST FIX:\n  " + firstN(mustFix, 50).join('\n  ') + (mustFix.size() > 50 ? "\n  ... (${mustFix.size() - 50} more in report)" : '') }
+  if (advisory) { echo "🟡 ADVISORY: ${advisory.size()} item(s), see report" }
+}
+
+def firstN(List items, int n) {
+  return items.size() > n ? items.subList(0, n) : items
+}
+
+def decide(String name, List fail, List mustFix, boolean enforce) {
+  if (fail && enforce) {
+    error("🔴 ${name} failed: ${fail.size()} blocking finding(s).")
+  } else if (fail || mustFix) {
+    unstable("🟠 ${name} found issues. See the archived report.")
+  } else {
+    echo "✅ ${name}: no blocking or must-fix issues"
   }
 }

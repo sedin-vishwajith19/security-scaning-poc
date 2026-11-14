@@ -1,203 +1,103 @@
-// Security scanning POC: 3 tools, 3 reports
-//   1. gitleaks -> gitleaks-report.json            (secrets in code + Git history)
-//   2. Semgrep  -> semgrep-report.json             (Dockerfile + Docker Compose, later app code)
-//   3. Trivy    -> trivy-report.json (+ .html)     (Docker image: CVEs, secrets in layers, EOL OS)
-//
-// Plugins: Pipeline, Git, Pipeline Utility Steps (readJSON), Timestamper
-// Tools in the Jenkins container: gitleaks, semgrep (+ /opt/semgrep-rules/community), trivy
+// Load the shared library registered as 'security-lib'
+@Library('security-lib') _
 
 pipeline {
   agent any
 
-  parameters {
-    string(name: 'IMAGE_TO_SCAN', defaultValue: 'python:3.8-slim-buster',
-           description: 'Image for Trivy to scan from the registry (no Docker needed). Try python:3.12-slim for the "after" run.')
-    booleanParam(name: 'ENFORCE_SECRET_SCAN', defaultValue: false, description: 'gitleaks: fail build on 🔴 findings')
-    booleanParam(name: 'ENFORCE_CONFIG_SCAN', defaultValue: false, description: 'Semgrep: fail build on 🔴 findings')
-    booleanParam(name: 'ENFORCE_IMAGE_SCAN',  defaultValue: false, description: 'Trivy: fail build on 🔴 findings')
-  }
-
-  options {
-    timestamps()
-    skipDefaultCheckout()
-  }
-
   environment {
-    SEMGREP_SEND_METRICS = 'off'
-    COMMUNITY_RULES      = '/opt/semgrep-rules/community'
-    CODE_RULE_DIRS       = ''   // later, e.g. "/opt/semgrep-rules/community/python /opt/semgrep-rules/community/javascript"
+    // Docker image name for this build
+    IMAGE_NAME = "myapp:${BUILD_NUMBER}"
+
+    // POC: the Jenkins container has no Docker, so we cannot build IMAGE_NAME.
+    // Trivy scans this registry image instead (pulled directly, no Docker needed).
+    //   python:3.13-slim -> 0 CRITICAL      (gate passes)
+    //   python:3.7-slim  -> 13 fixable CRIT (gate fails)
+    TRIVY_IMAGE = "python:3.13-slim"
+
+    // Redmine Configuration
+    REDMINE_URL = "http://host.docker.internal:3000" // Use IP/domain if Jenkins is remote
+    REDMINE_PROJECT = "security"
   }
 
   stages {
-
-    stage('Checkout') {
-      steps { checkout scm }
+    stage('Checkout Code') {
+      steps {
+        checkout scm
+      }
     }
 
-    // =====================================================================
-    // 1. gitleaks
-    // =====================================================================
-    stage('1. Secret scan (gitleaks)') {
+    stage('Security: Secrets Scan (Gitleaks)') {
       steps {
-        sh '''
-          gitleaks git . \
-            --config .gitleaks.toml \
-            --redact \
-            --report-format json \
-            --report-path gitleaks-report.json \
-            --exit-code 0
-        '''
         script {
-          def findings = readJSON(file: 'gitleaks-report.json') ?: []
-          def nonBlockingRules = ['generic-api-key', 'jwt']
-          def fail = [], mustFix = []
+          // 1. Scan full Git history for committed secrets
+          def findings = securityScan.gitleaks(
+            report: 'gitleaks-report.json'
+          )
 
-          findings.each { f ->
-            def line = "${f.RuleID} -> ${f.File}:${f.StartLine} (commit ${f.Commit.substring(0, 8)}, ${f.Author})"
-            if (f.RuleID in nonBlockingRules) { mustFix << line } else { fail << line }
-          }
-
-          printSummary('gitleaks', fail, mustFix, [])
-          decide('Secret scan', fail, mustFix, params.ENFORCE_SECRET_SCAN)
+          // 2. Automatically create Redmine tickets for any secrets found
+          // (Deduplicates tickets automatically via [SEC-<hash>] marker)
+          redmineTicket(
+            findings     : findings,
+            url          : env.REDMINE_URL,
+            project      : env.REDMINE_PROJECT,
+            credentialsId: 'redmine-api-key',
+            dryRun       : false,              // Set true to test without creating tickets
+            maxTickets   : 10
+          )
         }
       }
-      post { always { archiveArtifacts artifacts: 'gitleaks-report.json', allowEmptyArchive: true } }
     }
 
-    // =====================================================================
-    // 2. Semgrep
-    // =====================================================================
-    stage('2. Config scan (Semgrep)') {
+    stage('Security: SAST & IaC (Semgrep)') {
       steps {
-        sh '''
-          # Semgrep auto-detects only "Dockerfile" / "*.dockerfile"; pass other names explicitly
-          EXTRA_DOCKERFILES=$(find . -path ./.git -prune -o -type f \\( -name 'Dockerfile.*' -o -name '*.Dockerfile' \\) -print | tr '\\n' ' ')
-
-          CODE_CONFIGS=""
-          for d in $CODE_RULE_DIRS; do CODE_CONFIGS="$CODE_CONFIGS --config $d"; done
-
-          semgrep scan \
-            --config "$COMMUNITY_RULES/dockerfile" \
-            --config semgrep-rules/ \
-            $CODE_CONFIGS \
-            --exclude semgrep-rules \
-            --scan-unknown-extensions \
-            --metrics=off \
-            --disable-version-check \
-            --json -o semgrep-report.json \
-            . $EXTRA_DOCKERFILES
-        '''
         script {
-          def report = readJSON(file: 'semgrep-report.json')
-          def ignoredRules = ['secret-in-build-arg']   // duplicate of our stricter 'dockerfile-secret-in-arg'
-          def overrides = [
-            'missing-user'         : 'MUST-FIX',
-            'last-user-is-root'    : 'MUST-FIX',
-            'avoid-latest-version' : 'MUST-FIX',
-            'missing-image-version': 'MUST-FIX',
-            'remove-package-cache' : 'ADVISORY',
-            'remove-package-lists' : 'ADVISORY',
-            'set-pipefail'         : 'ADVISORY',
-          ]
-          def fail = [], mustFix = [], advisory = []
-
-          (report.results ?: []).each { r ->
-            def ruleId = r.check_id.tokenize('.').last()
-            if (ruleId in ignoredRules) { return }
-            def isConfigRule = r.check_id.contains('dockerfile') || ruleId.startsWith('dockerfile-') || ruleId.startsWith('compose-')
-
-            def level
-            if (overrides.containsKey(ruleId))      { level = overrides[ruleId] }
-            else if (r.extra.severity == 'ERROR')   { level = isConfigRule ? 'FAIL' : 'MUST-FIX' }  // code findings don't fail (yet)
-            else if (r.extra.severity == 'WARNING') { level = 'MUST-FIX' }
-            else                                    { level = 'ADVISORY' }
-
-            def line = "${ruleId} -> ${r.path}:${r.start.line}"
-            if (level == 'FAIL') { fail << line } else if (level == 'MUST-FIX') { mustFix << line } else { advisory << line }
-          }
-          (report.errors ?: []).each { e -> echo "⚠️ Semgrep error: ${e.message}" }
-
-          printSummary('Semgrep', fail, mustFix, advisory)
-          decide('Config scan', fail, mustFix, params.ENFORCE_CONFIG_SCAN)
+          // Scans Dockerfile, docker-compose.yml + application code
+          securityScan.semgrep(
+            languages: ['python', 'javascript'],
+            report   : 'semgrep-report.json'
+          )
         }
       }
-      post { always { archiveArtifacts artifacts: 'semgrep-report.json', allowEmptyArchive: true } }
     }
 
-    // =====================================================================
-    // 3. Trivy
-    // =====================================================================
-    stage('3. Image scan (Trivy)') {
+    stage('Build Container Image') {
       steps {
-        sh '''
-          # --image-src remote: pull the image straight from the registry (no Docker daemon needed)
-          trivy image \
-            --image-src remote \
-            --scanners vuln,secret \
-            --format json \
-            --output trivy-report.json \
-            --exit-code 0 \
-            --no-progress \
-            "$IMAGE_TO_SCAN"
+        // POC: no Docker in the Jenkins container. Real pipelines run:
+        //   sh "docker build -t ${IMAGE_NAME} ."
+        echo "Skipping docker build of ${IMAGE_NAME} (no Docker in Jenkins). Trivy will scan ${TRIVY_IMAGE}."
+      }
+    }
 
-          # Human-friendly HTML version of the same report (for managers)
-          if [ -f /opt/trivy/contrib/html.tpl ]; then
-            trivy convert --format template --template "@/opt/trivy/contrib/html.tpl" \
-              --output trivy-report.html trivy-report.json || echo "HTML report skipped"
-          fi
-        '''
+    stage('Security: Container Vulnerability Scan (Trivy)') {
+      steps {
         script {
-          def report = readJSON(file: 'trivy-report.json')
-          def fail = [], mustFix = [], advisory = []
-
-          // Base image OS end-of-life (no more security fixes)
-          def os = report.Metadata?.OS
-          if (os?.EOSL) { mustFix << "Base image OS is END-OF-LIFE: ${os.Family} ${os.Name}" }
-
-          (report.Results ?: []).each { res ->
-            // Secrets baked into image layers
-            (res.Secrets ?: []).each { s ->
-              fail << "SECRET ${s.RuleID} in ${res.Target}:${s.StartLine}"
-            }
-            // Vulnerabilities
-            (res.Vulnerabilities ?: []).each { v ->
-              def fixed = v.FixedVersion ? true : false
-              def line  = "${v.Severity} ${v.VulnerabilityID} ${v.PkgName} ${v.InstalledVersion} -> ${v.FixedVersion ?: 'no fix yet'}"
-              if (v.Severity == 'CRITICAL' && fixed)  { fail << line }
-              else if (v.Severity == 'HIGH' && fixed) { mustFix << line }
-              else                                    { advisory << line }
-            }
-          }
-
-          printSummary('Trivy', fail, mustFix, advisory)
-          decide('Image scan', fail, mustFix, params.ENFORCE_IMAGE_SCAN)
+          // Policy: Fails the build if fixable CRITICAL CVEs > maxCritical
+          trivyScan(
+            image       : env.TRIVY_IMAGE,
+            maxCritical : 0,           // Strict: 0 fixable CRITICALs allowed
+            onlyFixable : true,        // Ignore unfixable/upstream zero-days
+            report      : 'trivy-report.json'
+          )
         }
       }
-      post { always { archiveArtifacts artifacts: 'trivy-report.json, trivy-report.html', allowEmptyArchive: true } }
+    }
+
+    stage('Deploy') {
+      steps {
+        echo "All security quality gates passed! Ready to deploy ${IMAGE_NAME}."
+      }
     }
   }
-}
 
-// -------------------------------------------------------------------------
-// Helpers (these will move into the Shared Library in the next step)
-// -------------------------------------------------------------------------
-def printSummary(String tool, List fail, List mustFix, List advisory) {
-  echo "${tool}: 🔴 fail: ${fail.size()} | 🟠 must-fix: ${mustFix.size()} | 🟡 advisory: ${advisory.size()}"
-  if (fail)     { echo "🔴 FAIL:\n  "     + firstN(fail, 50).join('\n  ') }
-  if (mustFix)  { echo "🟠 MUST FIX:\n  " + firstN(mustFix, 50).join('\n  ') + (mustFix.size() > 50 ? "\n  ... (${mustFix.size() - 50} more in report)" : '') }
-  if (advisory) { echo "🟡 ADVISORY: ${advisory.size()} item(s), see report" }
-}
-
-def firstN(List items, int n) {
-  return items.size() > n ? items.subList(0, n) : items
-}
-
-def decide(String name, List fail, List mustFix, boolean enforce) {
-  if (fail && enforce) {
-    error("🔴 ${name} failed: ${fail.size()} blocking finding(s).")
-  } else if (fail || mustFix) {
-    unstable("🟠 ${name} found issues. See the archived report.")
-  } else {
-    echo "✅ ${name}: no blocking or must-fix issues"
+  post {
+    always {
+      sh 'rm -rf .security'
+    }
+    unstable {
+      echo "⚠️ Build completed with warnings (Secrets or Semgrep issues detected). Check archived reports."
+    }
+    failure {
+      echo "❌ Build failed! (Trivy found unacceptable CRITICAL vulnerabilities or compile error)."
+    }
   }
 }

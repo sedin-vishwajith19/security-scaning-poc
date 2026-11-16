@@ -1,0 +1,6 @@
+services:
+  web:
+    image: nginx
+    privileged: true                      # Triggers compose-privileged (ERROR)
+    ports:
+      - "5432:5432"                       # Triggers compose-db-port-on-all-interfaces (WARNING)

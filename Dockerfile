@@ -1,8 +1,8 @@
 # INTENTIONALLY INSECURE Dockerfile for the KICS POC demo.
 # Every line below should trigger a finding. All values are fake.
 
-# Uses :latest (unpinned)
-FROM python:latest
+# Base image (Test 3: change to python:3.7-slim -> Trivy gate fails)
+FROM python:3.13-slim
 
 # Hardcoded secret in ENV -> should FAIL the build
 ENV DB_PASSWORD=Sup3rS3cretValue99
@@ -11,7 +11,7 @@ ENV DB_PASSWORD=Sup3rS3cretValue99
 RUN apt-get update && apt-get install -y curl sudo
 
 # ADD with a remote URL instead of COPY
-ADD https://example.com/tools/app-tool.tar.gz /opt/
+ADD https://example.com/ /opt/example.html
 
 # pip without --no-cache-dir and without pinned version
 RUN pip install flask

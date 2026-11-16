@@ -4,6 +4,7 @@
 services:
   app:
     build: .
+    image: ${IMAGE_NAME:-myapp:local}            # tag used by Jenkins (IMAGE_NAME = myapp:<build>)
     privileged: true                         # FAIL: privileged container
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock   # FAIL: Docker socket mounted

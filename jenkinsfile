@@ -5,14 +5,10 @@ pipeline {
   agent any
 
   environment {
-    // Docker image name for this build
-    IMAGE_NAME = "myapp:${BUILD_NUMBER}"
-
-    // POC: the Jenkins container has no Docker, so we cannot build IMAGE_NAME.
-    // Trivy scans this registry image instead (pulled directly, no Docker needed).
-    //   python:3.13-slim -> 0 CRITICAL      (gate passes)
-    //   python:3.7-slim  -> 13 fixable CRIT (gate fails)
-    TRIVY_IMAGE = "python:3.13-slim"
+    // Docker image name for this build. Docker Compose tags the "app" service with it
+    // (see "image: ${IMAGE_NAME:-myapp:local}" in Dockerfile-compose.yaml).
+    IMAGE_NAME   = "myapp:${BUILD_NUMBER}"
+    COMPOSE_FILE = "Dockerfile-compose.yaml"
 
     // Redmine Configuration
     REDMINE_URL = "http://host.docker.internal:3000" // Use IP/domain if Jenkins is remote
@@ -62,18 +58,19 @@ pipeline {
 
     stage('Build Container Image') {
       steps {
-        // POC: no Docker in the Jenkins container. Real pipelines run:
-        //   sh "docker build -t ${IMAGE_NAME} ."
-        echo "Skipping docker build of ${IMAGE_NAME} (no Docker in Jenkins). Trivy will scan ${TRIVY_IMAGE}."
+        // Build exactly the image Docker Compose runs (service "app"), tagged as IMAGE_NAME
+        sh 'docker compose build --pull app'
+        sh 'docker image ls "$IMAGE_NAME"'
       }
     }
 
     stage('Security: Container Vulnerability Scan (Trivy)') {
       steps {
         script {
+          // Scans the image built above (from the local Docker daemon)
           // Policy: Fails the build if fixable CRITICAL CVEs > maxCritical
           trivyScan(
-            image       : env.TRIVY_IMAGE,
+            image       : env.IMAGE_NAME,
             maxCritical : 0,           // Strict: 0 fixable CRITICALs allowed
             onlyFixable : true,        // Ignore unfixable/upstream zero-days
             report      : 'trivy-report.json'
@@ -92,6 +89,8 @@ pipeline {
   post {
     always {
       sh 'rm -rf .security'
+      // Don't fill the host disk with one image per build (push to ECR before this in real pipelines)
+      sh 'docker image rm -f "$IMAGE_NAME" || true'
     }
     unstable {
       echo "⚠️ Build completed with warnings (Secrets or Semgrep issues detected). Check archived reports."
